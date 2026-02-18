@@ -1,0 +1,2 @@
+- name: mini_swe_agent
+  _target_: recipe.mini_swe_agent.swe_agent_loop.MiniSWEAgentLoop
