@@ -110,7 +110,7 @@ async def agent_node(state: MessagesState, config: RunnableConfig) -> dict:
     """Call the LLM with the bash tool bound."""
     model = config["configurable"]["model"]
     # Bind the bash tool so the LLM uses tool-calling format
-    model_with_tools = model.bind_tools([bash])
+    model_with_tools = model.bind_tools([bash], tool_choice="required")
     response = await model_with_tools.ainvoke(state["messages"])
     return {"messages": [response]}
 
@@ -155,7 +155,11 @@ async def bash_executor_node(state: MessagesState, config: RunnableConfig) -> di
 
 def format_error_node(state: MessagesState, config: RunnableConfig) -> dict:
     """Send format error feedback when model doesn't produce tool calls."""
-    return {"messages": [HumanMessage(content=FORMAT_ERROR_TEMPLATE)]}
+    error_content = render_template(
+        FORMAT_ERROR_TEMPLATE,
+        error="No tool calls found. Every response MUST include at least one bash tool call.",
+    )
+    return {"messages": [HumanMessage(content=error_content)]}
 
 
 def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["bash_executor", "format_error", "__end__"]:
@@ -191,7 +195,7 @@ def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["
     # No tool calls — retry with format error feedback (mini-swe-agent v2 behavior)
     format_errors = sum(
         1 for m in state["messages"]
-        if isinstance(m, HumanMessage) and m.content == FORMAT_ERROR_TEMPLATE
+        if isinstance(m, HumanMessage) and "Tool call error:" in (m.content or "")
     )
     if format_errors < MAX_FORMAT_RETRIES:
         logger.warning(f"No tool calls, sending format error feedback (retry {format_errors + 1}/{MAX_FORMAT_RETRIES})")
@@ -414,7 +418,7 @@ async def run_standalone(
                         print(msg.content)
                         sys.stdout.flush()
 
-                    elif isinstance(msg, HumanMessage) and msg.content == FORMAT_ERROR_TEMPLATE:
+                    elif isinstance(msg, HumanMessage) and "Tool call error:" in (msg.content or ""):
                         print(f"\n--- Format Error (retrying) ---")
                         print(msg.content[:200])
                         sys.stdout.flush()
