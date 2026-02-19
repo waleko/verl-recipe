@@ -48,6 +48,7 @@ OBSERVATION_TEMPLATE = _default_config["model"]["observation_template"]
 FORMAT_ERROR_TEMPLATE = _default_config["model"]["format_error_template"]
 
 SUBMIT_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+MAX_FORMAT_RETRIES = 3
 
 # Environment variables set inside the sandbox (matches mini-swe-agent v2)
 SANDBOX_ENV_VARS = _default_config.get("environment", {}).get("env", {
@@ -124,11 +125,16 @@ async def bash_executor_node(state: MessagesState, config: RunnableConfig) -> di
     assert isinstance(last_message, AIMessage)
 
     results = []
+    submitted = False
     for tool_call in last_message.tool_calls:
         command = tool_call["args"].get("command", "")
 
         exec_result = await sandbox_manager.execute(sandbox, command, timeout=command_timeout)
         output = (exec_result.stdout or "") + ("\n" + exec_result.stderr if exec_result.stderr else "")
+
+        # Check for submission in stdout (mini-swe-agent v2 style)
+        if SUBMIT_SENTINEL in output and exec_result.return_code == 0:
+            submitted = True
 
         observation = format_observation(
             output=output,
@@ -140,13 +146,19 @@ async def bash_executor_node(state: MessagesState, config: RunnableConfig) -> di
                 content=observation,
                 tool_call_id=tool_call["id"],
                 name="bash",
+                additional_kwargs={"submitted": submitted},
             )
         )
 
     return {"messages": results}
 
 
-def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["bash_executor", "__end__"]:
+def format_error_node(state: MessagesState, config: RunnableConfig) -> dict:
+    """Send format error feedback when model doesn't produce tool calls."""
+    return {"messages": [HumanMessage(content=FORMAT_ERROR_TEMPLATE)]}
+
+
+def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["bash_executor", "format_error", "__end__"]:
     """Route after the agent node."""
     max_turns = config["configurable"].get("max_turns", 30)
 
@@ -176,29 +188,55 @@ def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["
     if last_message.tool_calls:
         return "bash_executor"
 
-    # No tool calls — end
-    logger.warning("No tool calls found in agent response, ending")
+    # No tool calls — retry with format error feedback (mini-swe-agent v2 behavior)
+    format_errors = sum(
+        1 for m in state["messages"]
+        if isinstance(m, HumanMessage) and m.content == FORMAT_ERROR_TEMPLATE
+    )
+    if format_errors < MAX_FORMAT_RETRIES:
+        logger.warning(f"No tool calls, sending format error feedback (retry {format_errors + 1}/{MAX_FORMAT_RETRIES})")
+        return "format_error"
+
+    logger.warning(f"No tool calls after {MAX_FORMAT_RETRIES} retries, ending")
     return END
+
+
+def route_after_bash(state: MessagesState, config: RunnableConfig) -> Literal["agent", "__end__"]:
+    """Route after bash executor — check if submission was detected in output."""
+    for msg in reversed(state["messages"]):
+        if not isinstance(msg, ToolMessage):
+            break
+        if msg.additional_kwargs.get("submitted"):
+            logger.info("Agent submitted solution (detected in stdout)")
+            return END
+    return "agent"
 
 
 def build_swe_agent_graph() -> StateGraph:
     """Build the LangGraph StateGraph for the mini SWE agent.
 
-    Graph: agent → route → bash_executor → agent (loop)
-                        → END (submit / turn limit / no tools)
+    Graph: agent → route → bash_executor → route_bash → agent (loop)
+                        → format_error → agent (retry)
+                        → END (submit / turn limit / retry limit)
     """
     workflow = StateGraph(MessagesState)
 
     workflow.add_node("agent", agent_node)
     workflow.add_node("bash_executor", bash_executor_node)
+    workflow.add_node("format_error", format_error_node)
 
     workflow.set_entry_point("agent")
     workflow.add_conditional_edges(
         "agent",
         route_after_agent,
-        {"bash_executor": "bash_executor", END: END},
+        {"bash_executor": "bash_executor", "format_error": "format_error", END: END},
     )
-    workflow.add_edge("bash_executor", "agent")
+    workflow.add_conditional_edges(
+        "bash_executor",
+        route_after_bash,
+        {"agent": "agent", END: END},
+    )
+    workflow.add_edge("format_error", "agent")
 
     return workflow.compile()
 
@@ -374,6 +412,11 @@ async def run_standalone(
                     elif isinstance(msg, ToolMessage):
                         print(f"\n--- Observation ---")
                         print(msg.content)
+                        sys.stdout.flush()
+
+                    elif isinstance(msg, HumanMessage) and msg.content == FORMAT_ERROR_TEMPLATE:
+                        print(f"\n--- Format Error (retrying) ---")
+                        print(msg.content[:200])
                         sys.stdout.flush()
 
         # 5. Compute reward
