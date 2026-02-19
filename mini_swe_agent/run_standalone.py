@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Standalone mini SWE agent runner using mini-swe-agent v2 directly.
+"""Standalone mini SWE agent — LangGraph prototype for verl integration.
 
-Uses mini-swe-agent v2's DefaultAgent + LitellmModel with a custom
-HarborEnvironment that executes commands in Harbor sandboxes (E2B/Docker).
-This gives us 100% identical behavior to mini-swe-agent v2: same prompts,
-same tool calling, same error handling, same observation formatting.
+LangGraph agent loop with mini-swe-agent v2's exact prompts, observation
+formatting, and tool definition. The graph structure mirrors verl's
+ReactAgentLoop so that swapping ChatOpenAI → verl's ChatModel is a
+one-line change for RL training.
+
+Standalone (this file):  ChatOpenAI  + HarborSandboxToolNode
+verl training:           ChatModel   + HarborSandboxToolNode (same graph)
 
 Usage:
     E2B_API_KEY=... OPENAI_API_KEY=... python recipe/mini_swe_agent/run_standalone.py \
         --dataset swebench-verified@1.0 --task-index 0 --model gpt-4o
 
 Requires:
-    pip install mini-swe-agent harbor
+    pip install mini-swe-agent langchain-openai langgraph harbor
 """
 
 import argparse
@@ -20,139 +23,247 @@ import logging
 import os
 import platform
 import sys
-from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import yaml
-from minisweagent import package_dir as _mswea_dir
-from minisweagent.agents.default import DefaultAgent
-from minisweagent.exceptions import Submitted
-from minisweagent.models import get_model
+from jinja2 import StrictUndefined, Template
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langgraph.graph import END, MessagesState, StateGraph
 
 logger = logging.getLogger(__name__)
 
-# Load mini-swe-agent v2's tool-calling config
+# ---------------------------------------------------------------------------
+# Load everything from mini-swe-agent v2's mini.yaml — the tool-calling config
+# ---------------------------------------------------------------------------
+
+from minisweagent import package_dir as _mswea_dir
+
 _mswea_config = yaml.safe_load((_mswea_dir / "config" / "mini.yaml").read_text())
 
+SYSTEM_TEMPLATE = _mswea_config["agent"]["system_template"]
+INSTANCE_TEMPLATE = _mswea_config["agent"]["instance_template"]
+OBSERVATION_TEMPLATE = _mswea_config["model"]["observation_template"]
+FORMAT_ERROR_TEMPLATE = _mswea_config["model"]["format_error_template"]
+
+SUBMIT_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+MAX_FORMAT_RETRIES = 3
+
+# Same env vars mini-swe-agent v2 sets in the sandbox
+SANDBOX_ENV_VARS = _mswea_config.get("environment", {}).get("env", {})
 
 # ---------------------------------------------------------------------------
-# HarborEnvironment — implements mini-swe-agent v2's Environment protocol
+# Bash tool — identical schema to mini-swe-agent v2's BASH_TOOL
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class HarborEnvironmentConfig:
-    env: dict = field(default_factory=lambda: {
-        "PAGER": "cat",
-        "MANPAGER": "cat",
-        "LESS": "-R",
-        "PIP_PROGRESS_BAR": "off",
-        "TQDM_DISABLE": "1",
-    })
-    timeout: int = 120
+@tool
+def bash(command: str) -> str:
+    """Execute a bash command."""
+    # Placeholder — actual execution is in bash_executor_node via Harbor
+    return command
 
 
-class HarborEnvironment:
-    """mini-swe-agent v2 Environment backed by a Harbor sandbox.
+# ---------------------------------------------------------------------------
+# Observation formatting — mini-swe-agent v2's Jinja2 template
+# ---------------------------------------------------------------------------
 
-    Implements the Environment protocol:
-        - execute(action, cwd) -> dict
-        - get_template_vars() -> dict
-        - serialize() -> dict
+_observation_tpl = Template(OBSERVATION_TEMPLATE, undefined=StrictUndefined)
+_format_error_tpl = Template(FORMAT_ERROR_TEMPLATE, undefined=StrictUndefined)
+
+
+def format_observation(output: str, returncode: int, exception_info: str = "") -> str:
+    """Format command output using mini-swe-agent v2's observation template."""
+    return _observation_tpl.render(
+        output={"output": output, "returncode": returncode, "exception_info": exception_info},
+    )
+
+
+def format_error(error: str) -> str:
+    """Format a tool-call error using mini-swe-agent v2's error template."""
+    return _format_error_tpl.render(error=error)
+
+
+# ---------------------------------------------------------------------------
+# Template rendering (for system/instance prompts)
+# ---------------------------------------------------------------------------
+
+
+def render_template(template: str, **kwargs) -> str:
+    """Render a Jinja2 template with the given variables."""
+    return Template(template, undefined=StrictUndefined).render(**kwargs)
+
+
+def build_initial_messages(instruction: str) -> list:
+    """Build system + user messages using mini-swe-agent v2's templates."""
+    template_vars = {
+        "task": instruction,
+        "system": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+    }
+    return [
+        SystemMessage(content=render_template(SYSTEM_TEMPLATE, **template_vars)),
+        HumanMessage(content=render_template(INSTANCE_TEMPLATE, **template_vars)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# LangGraph nodes
+# ---------------------------------------------------------------------------
+
+
+async def agent_node(state: MessagesState, config: RunnableConfig) -> dict:
+    """Call the LLM with the bash tool bound."""
+    model = config["configurable"]["model"]
+    model_with_tools = model.bind_tools([bash])
+    response = await model_with_tools.ainvoke(state["messages"])
+    return {"messages": [response]}
+
+
+async def bash_executor_node(state: MessagesState, config: RunnableConfig) -> dict:
+    """Execute tool calls in the Harbor sandbox.
+
+    Formats observations using mini-swe-agent v2's JSON template.
+    Detects submission sentinel in stdout (same as mswea v2's _check_finished).
     """
+    sandbox_manager = config["configurable"]["sandbox_manager"]
+    sandbox = config["configurable"]["sandbox"]
+    command_timeout = config["configurable"].get("command_timeout", 120)
 
-    def __init__(self, sandbox, sandbox_manager, *, timeout: int = 120):
-        self.sandbox = sandbox
-        self.sandbox_manager = sandbox_manager
-        self.config = HarborEnvironmentConfig(
-            env=_mswea_config.get("environment", {}).get("env", {}),
-            timeout=timeout,
+    last_message = state["messages"][-1]
+    assert isinstance(last_message, AIMessage)
+
+    results = []
+    for tool_call in last_message.tool_calls:
+        command = tool_call["args"].get("command", "")
+
+        exec_result = await sandbox_manager.execute(sandbox, command, timeout=command_timeout)
+        output = (exec_result.stdout or "") + ("\n" + exec_result.stderr if exec_result.stderr else "")
+
+        observation = format_observation(
+            output=output,
+            returncode=exec_result.return_code,
         )
 
-    def execute(self, action: dict, cwd: str = "") -> dict:
-        """Execute a command in the Harbor sandbox (sync wrapper over async)."""
-        command = action.get("command", "")
+        # Flag submission detected in stdout (mswea v2 style)
+        submitted = (
+            SUBMIT_SENTINEL in output.lstrip().splitlines()[0]
+            if output.strip() and exec_result.return_code == 0
+            else False
+        )
 
-        # Use nest_asyncio or thread to bridge sync/async
-        exec_result = _run_async(
-            self.sandbox_manager.execute(
-                self.sandbox, command, timeout=self.config.timeout,
+        results.append(
+            ToolMessage(
+                content=observation,
+                tool_call_id=tool_call["id"],
+                name="bash",
+                additional_kwargs={"submitted": submitted},
             )
         )
 
-        output = (exec_result.stdout or "") + (
-            "\n" + exec_result.stderr if exec_result.stderr else ""
-        )
-
-        result = {
-            "output": output,
-            "returncode": exec_result.return_code,
-            "exception_info": "",
-        }
-
-        # Check for submission — same logic as mini-swe-agent v2's _check_finished
-        self._check_finished(result)
-
-        return result
-
-    def _check_finished(self, output: dict):
-        """Raise Submitted if output starts with the sentinel."""
-        lines = output.get("output", "").lstrip().splitlines(keepends=True)
-        if (
-            lines
-            and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-            and output["returncode"] == 0
-        ):
-            submission = "".join(lines[1:])
-            raise Submitted(
-                {
-                    "role": "exit",
-                    "content": submission,
-                    "extra": {
-                        "exit_status": "Submitted",
-                        "submission": submission,
-                    },
-                }
-            )
-
-    def get_template_vars(self, **kwargs) -> dict:
-        """Return template variables for prompt rendering."""
-        return {
-            "system": platform.system(),
-            "release": platform.release(),
-            "version": platform.version(),
-            "machine": platform.machine(),
-            **self.config.env,
-            **kwargs,
-        }
-
-    def serialize(self) -> dict:
-        return {
-            "info": {
-                "config": {
-                    "environment": {
-                        "env": self.config.env,
-                        "timeout": self.config.timeout,
-                    }
-                }
-            }
-        }
+    return {"messages": results}
 
 
-def _run_async(coro):
-    """Run an async coroutine from sync code, even inside an existing event loop."""
-    import concurrent.futures
+def format_error_node(state: MessagesState, config: RunnableConfig) -> dict:
+    """Send format error feedback — same message mini-swe-agent v2 sends."""
+    content = format_error("No tool calls found. Every response MUST include at least one bash tool call.")
+    return {"messages": [HumanMessage(content=content)]}
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop — just use asyncio.run
-        return asyncio.run(coro)
 
-    # Running inside an event loop (e.g., from asyncio.run) —
-    # execute in a separate thread to avoid blocking
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(asyncio.run, coro)
-        return future.result()
+# ---------------------------------------------------------------------------
+# LangGraph routing
+# ---------------------------------------------------------------------------
+
+
+def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["tools", "format_error", "__end__"]:
+    """Route after agent node — mirrors ReactAgentLoop's should_continue."""
+    max_turns = config["configurable"].get("max_turns", 30)
+
+    num_ai = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
+    if num_ai >= max_turns:
+        logger.info(f"Turn limit reached ({num_ai}/{max_turns})")
+        return END
+
+    last = state["messages"][-1]
+    if not isinstance(last, AIMessage):
+        return END
+
+    # Check submission in tool-call commands
+    for tc in last.tool_calls:
+        if SUBMIT_SENTINEL in tc["args"].get("command", ""):
+            logger.info("Agent submitted (in command)")
+            return END
+
+    # Check submission in text content
+    if SUBMIT_SENTINEL in (last.content or ""):
+        logger.info("Agent submitted (in content)")
+        return END
+
+    # Has tool calls → execute
+    if last.tool_calls:
+        return "tools"
+
+    # No tool calls → format error retry (mswea v2 FormatError behavior)
+    n_errors = sum(
+        1 for m in state["messages"]
+        if isinstance(m, HumanMessage) and "Tool call error:" in (m.content or "")
+    )
+    if n_errors < MAX_FORMAT_RETRIES:
+        logger.warning(f"No tool calls, format error retry {n_errors + 1}/{MAX_FORMAT_RETRIES}")
+        return "format_error"
+
+    logger.warning("Format error retry limit reached, ending")
+    return END
+
+
+def route_after_tools(state: MessagesState, config: RunnableConfig) -> Literal["agent", "__end__"]:
+    """Route after tool execution — detect submission in stdout."""
+    for msg in reversed(state["messages"]):
+        if not isinstance(msg, ToolMessage):
+            break
+        if msg.additional_kwargs.get("submitted"):
+            logger.info("Agent submitted (detected in stdout)")
+            return END
+    return "agent"
+
+
+# ---------------------------------------------------------------------------
+# Graph builder — structure matches ReactAgentLoop for verl compatibility
+# ---------------------------------------------------------------------------
+
+
+def build_swe_agent_graph():
+    """Build the LangGraph graph.
+
+    Graph:  agent → route → tools → route_tools → agent  (loop)
+                         → format_error → agent           (retry)
+                         → END                            (done)
+
+    To integrate with verl: swap the model in config["configurable"]["model"]
+    from ChatOpenAI to verl's ChatModel. Everything else stays the same.
+    """
+    workflow = StateGraph(MessagesState)
+
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", bash_executor_node)
+    workflow.add_node("format_error", format_error_node)
+
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", route_after_agent, {
+        "tools": "tools",
+        "format_error": "format_error",
+        END: END,
+    })
+    workflow.add_conditional_edges("tools", route_after_tools, {
+        "agent": "agent",
+        END: END,
+    })
+    workflow.add_edge("format_error", "agent")
+
+    return workflow.compile()
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +293,9 @@ def download_harbor_dataset(dataset: str) -> list:
 def load_harbor_task_from_dataset(dataset: str, task_index: int) -> tuple[str, str]:
     """Load a single task from a Harbor dataset registry."""
     from harbor import Task
-
     downloaded_tasks = download_harbor_dataset(dataset)
     if task_index >= len(downloaded_tasks):
-        raise IndexError(
-            f"Task index {task_index} out of range (has {len(downloaded_tasks)} tasks)"
-        )
+        raise IndexError(f"Task index {task_index} out of range (has {len(downloaded_tasks)} tasks)")
     task_path = str(downloaded_tasks[task_index].local_path)
     return task_path, Task(task_path).instruction
 
@@ -195,7 +303,6 @@ def load_harbor_task_from_dataset(dataset: str, task_index: int) -> tuple[str, s
 def load_harbor_task_from_path(task_path: str) -> tuple[str, str]:
     """Load a single task from a local Harbor task directory."""
     from harbor import Task
-
     return task_path, Task(task_path).instruction
 
 
@@ -213,14 +320,15 @@ async def run_standalone(
     env_type: str = "e2b",
     verbose: bool = True,
 ) -> tuple[list, float]:
-    """Run mini-swe-agent v2 on a single Harbor task.
+    """Run the SWE agent on a single Harbor task.
 
     Returns:
         Tuple of (messages list, reward score).
     """
+    from langchain_openai import ChatOpenAI
     from recipe.mini_swe_agent.harbor_sandbox import HarborSandboxManager
 
-    # 1. Create Harbor sandbox
+    llm = ChatOpenAI(model=model_name, temperature=0.0)
     sandbox_manager = HarborSandboxManager(env_type=env_type)
 
     if verbose:
@@ -228,42 +336,63 @@ async def run_standalone(
     sandbox = await sandbox_manager.create(task_path)
 
     try:
-        # 2. Create mini-swe-agent v2 model (uses litellm internally)
-        model_config = dict(_mswea_config.get("model", {}))
-        model = get_model(model_name, config=model_config)
-
-        # 3. Create HarborEnvironment implementing mswea's Environment protocol
-        env = HarborEnvironment(
-            sandbox=sandbox,
-            sandbox_manager=sandbox_manager,
-            timeout=command_timeout,
-        )
-
-        # 4. Create mini-swe-agent v2's DefaultAgent with config from mini.yaml
-        agent_config = dict(_mswea_config.get("agent", {}))
-        agent_config["step_limit"] = max_turns
-        agent_config["mode"] = "yolo"  # No confirmation prompts
-        agent = DefaultAgent(model=model, env=env, **agent_config)
+        messages = build_initial_messages(instruction)
+        graph = build_swe_agent_graph()
 
         if verbose:
             print(f"Starting agent loop (max {max_turns} turns, model={model_name})...")
 
-        # 5. Run the agent — this is mini-swe-agent v2's actual loop
-        result = agent.run(task=instruction)
+        config = {
+            "configurable": {
+                "model": llm,
+                "sandbox_manager": sandbox_manager,
+                "sandbox": sandbox,
+                "max_turns": max_turns,
+                "command_timeout": command_timeout,
+            },
+            "recursion_limit": max(50, max_turns * 3),
+        }
 
-        if verbose:
-            exit_status = result.get("exit_status", "Unknown")
-            print(f"\nAgent finished: {exit_status}")
-            _print_trajectory(agent.messages)
+        turn = 0
+        final_messages = messages[:]
 
-        # 6. Compute reward
+        async for event in graph.astream({"messages": messages}, config=config, stream_mode="updates"):
+            for node_name, update in event.items():
+                for msg in update.get("messages", []):
+                    final_messages.append(msg)
+
+                    if not verbose:
+                        continue
+
+                    if isinstance(msg, AIMessage):
+                        turn += 1
+                        print(f"\n{'='*60}")
+                        print(f"TURN {turn}")
+                        print(f"{'='*60}")
+                        if msg.content:
+                            print(msg.content)
+                        for tc in msg.tool_calls:
+                            print(f"\n> COMMAND: {tc['args'].get('command', '')}")
+                        sys.stdout.flush()
+
+                    elif isinstance(msg, ToolMessage):
+                        print(f"\n--- Observation ---")
+                        print(msg.content)
+                        sys.stdout.flush()
+
+                    elif isinstance(msg, HumanMessage):
+                        print(f"\n--- Format Error (retrying) ---")
+                        print(msg.content[:200])
+                        sys.stdout.flush()
+
+        # Compute reward
         if verbose:
             print("\nRunning verification tests...")
         reward = await sandbox_manager.compute_reward(sandbox)
         if verbose:
             print(f"Reward: {reward}")
 
-        return agent.messages, reward
+        return final_messages, reward
 
     finally:
         if verbose:
@@ -271,49 +400,9 @@ async def run_standalone(
         await sandbox_manager.destroy(sandbox)
 
 
-def _print_trajectory(messages: list[dict]):
-    """Print summary of the agent trajectory."""
-    turn = 0
-    for msg in messages:
-        role = msg.get("role", "")
-        if role == "system":
-            print(f"\n{'='*60}")
-            print(f"SYSTEM PROMPT ({len(msg.get('content', ''))} chars)")
-            print(f"{'='*60}")
-        elif role == "user":
-            print(f"\n{'='*60}")
-            print(f"USER ({len(msg.get('content', ''))} chars)")
-            print(f"{'='*60}")
-            content = msg.get("content", "")
-            if len(content) > 500:
-                print(content[:500] + "...")
-            else:
-                print(content)
-        elif role == "assistant":
-            turn += 1
-            print(f"\n{'='*60}")
-            print(f"TURN {turn}")
-            print(f"{'='*60}")
-            if msg.get("content"):
-                print(msg["content"])
-            for action in msg.get("extra", {}).get("actions", []):
-                print(f"\n> COMMAND: {action.get('command', '')}")
-        elif role == "tool":
-            print(f"\n--- Observation ---")
-            content = msg.get("content", "")
-            if len(content) > 1000:
-                print(content[:1000] + "... (truncated)")
-            else:
-                print(content)
-        elif role == "exit":
-            print(f"\n{'='*60}")
-            print(f"EXIT: {msg.get('extra', {}).get('exit_status', 'Unknown')}")
-            print(f"{'='*60}")
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Run mini-swe-agent v2 on a Harbor task.",
+        description="Run mini SWE agent v2 (LangGraph) on a Harbor task.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
@@ -327,35 +416,24 @@ Examples:
 
     task_group = parser.add_mutually_exclusive_group(required=True)
     task_group.add_argument("--dataset", type=str, help="Harbor dataset identifier")
-    task_group.add_argument(
-        "--task-path", type=str, help="Path to a local Harbor task directory"
-    )
+    task_group.add_argument("--task-path", type=str, help="Path to a local Harbor task directory")
 
     parser.add_argument("--task-index", type=int, default=0)
     parser.add_argument("--model", type=str, default="gpt-4o")
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--command-timeout", type=int, default=120)
-    parser.add_argument(
-        "--env-type",
-        type=str,
-        default="e2b",
-        choices=["e2b", "docker", "daytona"],
-    )
+    parser.add_argument("--env-type", type=str, default="e2b", choices=["e2b", "docker", "daytona"])
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
 
     log_level = logging.INFO if not args.quiet else logging.WARNING
-    logging.basicConfig(
-        level=log_level, format="%(asctime)s %(name)s %(levelname)s: %(message)s"
-    )
+    logging.basicConfig(level=log_level, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
     for noisy in ["httpcore", "httpx", "urllib3", "openai", "e2b", "langsmith"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if args.dataset:
-        task_path, instruction = load_harbor_task_from_dataset(
-            args.dataset, args.task_index
-        )
+        task_path, instruction = load_harbor_task_from_dataset(args.dataset, args.task_index)
     else:
         task_path, instruction = load_harbor_task_from_path(args.task_path)
 
