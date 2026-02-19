@@ -180,10 +180,10 @@ def format_error_node(state: MessagesState, config: RunnableConfig) -> dict:
 
 def route_after_agent(state: MessagesState, config: RunnableConfig) -> Literal["tools", "format_error", "__end__"]:
     """Route after agent node — mirrors ReactAgentLoop's should_continue."""
-    max_turns = config["configurable"].get("max_turns", 30)
+    max_turns = config["configurable"].get("max_turns", 0)
 
     num_ai = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
-    if num_ai >= max_turns:
+    if max_turns > 0 and num_ai >= max_turns:
         logger.info(f"Turn limit reached ({num_ai}/{max_turns})")
         return END
 
@@ -315,8 +315,8 @@ async def run_standalone(
     task_path: str,
     instruction: str,
     model_name: str = "gpt-4o",
-    max_turns: int = 30,
-    command_timeout: int = 120,
+    max_turns: int = 0,
+    command_timeout: int = 30,
     env_type: str = "e2b",
     verbose: bool = True,
 ) -> tuple[list, float]:
@@ -350,7 +350,7 @@ async def run_standalone(
                 "max_turns": max_turns,
                 "command_timeout": command_timeout,
             },
-            "recursion_limit": max(50, max_turns * 3),
+            "recursion_limit": max(200, max_turns * 3),
         }
 
         turn = 0
@@ -420,8 +420,8 @@ Examples:
 
     parser.add_argument("--task-index", type=int, default=0)
     parser.add_argument("--model", type=str, default="gpt-4o")
-    parser.add_argument("--max-turns", type=int, default=30)
-    parser.add_argument("--command-timeout", type=int, default=120)
+    parser.add_argument("--max-turns", type=int, default=0, help="0 = unlimited (uses cost limit like mswea v2)")
+    parser.add_argument("--command-timeout", type=int, default=30)
     parser.add_argument("--env-type", type=str, default="e2b", choices=["e2b", "docker", "daytona"])
     parser.add_argument("--quiet", action="store_true")
 

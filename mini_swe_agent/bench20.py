@@ -19,7 +19,7 @@ from recipe.mini_swe_agent.run_standalone import (
 
 CONCURRENCY = 20
 NUM_TASKS = 20
-DATASET = "swebench-verified@1.0"
+DATASET = "terminal-bench@2.0"
 
 
 async def run_one(task_path: str, instruction: str, idx: int, sem: asyncio.Semaphore, model: str):
@@ -31,8 +31,8 @@ async def run_one(task_path: str, instruction: str, idx: int, sem: asyncio.Semap
                 task_path=task_path,
                 instruction=instruction,
                 model_name=model,
-                max_turns=30,
-                command_timeout=120,
+                max_turns=0,
+                command_timeout=30,
                 verbose=False,
             )
             elapsed = time.monotonic() - t0
